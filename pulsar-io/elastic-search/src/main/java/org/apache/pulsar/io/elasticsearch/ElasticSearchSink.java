@@ -21,6 +21,7 @@ package org.apache.pulsar.io.elasticsearch;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.util.Arrays;
 import java.util.Map;
 
 import org.apache.commons.lang3.StringUtils;
@@ -41,6 +42,8 @@ import org.elasticsearch.action.admin.indices.create.CreateIndexResponse;
 import org.elasticsearch.action.admin.indices.get.GetIndexRequest;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
+import org.elasticsearch.action.delete.DeleteRequest;
+import org.elasticsearch.action.delete.DeleteResponse;
 import org.elasticsearch.client.Requests;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
@@ -54,10 +57,10 @@ import org.elasticsearch.common.xcontent.XContentType;
  * This class assumes that the input will be JSON documents
  */
 @Connector(
-    name = "elastic_search",
-    type = IOType.SINK,
-    help = "A sink connector that sends pulsar messages to elastic search",
-    configClass = ElasticSearchConfig.class
+        name = "elastic_search",
+        type = IOType.SINK,
+        help = "A sink connector that sends pulsar messages to elastic search",
+        configClass = ElasticSearchConfig.class
 )
 public class ElasticSearchSink implements Sink<byte[]> {
 
@@ -65,6 +68,12 @@ public class ElasticSearchSink implements Sink<byte[]> {
     private RestHighLevelClient client;
     private CredentialsProvider credentialsProvider;
     private ElasticSearchConfig elasticSearchConfig;
+
+
+    protected static final String ACTION = "ACTION";
+    protected static final String UPSERT = "UPSERT";
+    protected static final String DELETE = "DELETE";
+    protected static final String ID = "ID";
 
     @Override
     public void open(Map<String, Object> config, SinkContext sinkContext) throws Exception {
@@ -81,12 +90,38 @@ public class ElasticSearchSink implements Sink<byte[]> {
     @Override
     public void write(Record<byte[]> record) {
         KeyValue<String, byte[]> keyValue = extractKeyValue(record);
+        String action = record.getProperties().get(ACTION);
+
+        if (action == null) {
+            action = UPSERT;
+        }
+
+        switch (action) {
+            case DELETE:
+                DeleteRecord(record);
+                break;
+            case UPSERT:
+                UpsertRecord(record, keyValue);
+                break;
+            default:
+                String msg = String.format("Unsupported action %s, can be one of %s, or not set which indicate %s",
+                        action, Arrays.asList(UPSERT, DELETE), UPSERT);
+                throw new IllegalArgumentException(msg);
+        }
+    }
+
+    private void UpsertRecord(Record<byte[]> record, KeyValue<String, byte[]> keyValue){
+        String id = record.getProperties().get(ID);
+
         IndexRequest indexRequest = Requests.indexRequest(elasticSearchConfig.getIndexName());
         indexRequest.type(elasticSearchConfig.getTypeName());
+        if (id != null) {
+            indexRequest.id(id);
+        }
         indexRequest.source(keyValue.getValue(), XContentType.JSON);
 
         try {
-        IndexResponse indexResponse = getClient().index(indexRequest);
+            IndexResponse indexResponse = getClient().index(indexRequest);
             if (indexResponse.getResult().equals(DocWriteResponse.Result.CREATED)) {
                 record.ack();
             } else {
@@ -97,7 +132,29 @@ public class ElasticSearchSink implements Sink<byte[]> {
         }
     }
 
-    public KeyValue<String, byte[]> extractKeyValue(Record<byte[]> record) {
+    private void DeleteRecord(Record<byte[]> record){
+        String id = record.getProperties().get(ID);
+        if (id == null) {
+            String msg = String.format("%s request must have '%s' property",
+                    DELETE, ID);;
+            throw new IllegalArgumentException(msg);
+        }
+        DeleteRequest deleteRequest = Requests.deleteRequest(elasticSearchConfig.getIndexName());
+        deleteRequest.type(elasticSearchConfig.getTypeName());
+        deleteRequest.id(id);
+        try {
+            DeleteResponse indexResponse = getClient().delete(deleteRequest);
+            if (indexResponse.getResult().equals(DocWriteResponse.Result.DELETED)) {
+                record.ack();
+            } else {
+                record.fail();
+            }
+        } catch (final IOException ex) {
+            record.fail();
+        }
+    }
+
+    public KeyValue<String, byte[]>     extractKeyValue(Record<byte[]> record) {
         String key = record.getKey().orElse("");
         return new KeyValue<>(key, record.getValue());
     }
@@ -111,8 +168,8 @@ public class ElasticSearchSink implements Sink<byte[]> {
             CreateIndexRequest cireq = new CreateIndexRequest(elasticSearchConfig.getIndexName());
 
             cireq.settings(Settings.builder()
-               .put("index.number_of_shards", elasticSearchConfig.getIndexNumberOfShards())
-               .put("index.number_of_replicas", elasticSearchConfig.getIndexNumberOfReplicas()));
+                    .put("index.number_of_shards", elasticSearchConfig.getIndexNumberOfShards())
+                    .put("index.number_of_replicas", elasticSearchConfig.getIndexNumberOfReplicas()));
 
             CreateIndexResponse ciresp = getClient().indices().create(cireq);
             if (!ciresp.isAcknowledged() || !ciresp.isShardsAcknowledged()) {
@@ -131,7 +188,7 @@ public class ElasticSearchSink implements Sink<byte[]> {
     private CredentialsProvider getCredentialsProvider() {
 
         if (StringUtils.isEmpty(elasticSearchConfig.getUsername())
-            || StringUtils.isEmpty(elasticSearchConfig.getPassword())) {
+                || StringUtils.isEmpty(elasticSearchConfig.getPassword())) {
             return null;
         }
 
@@ -144,15 +201,15 @@ public class ElasticSearchSink implements Sink<byte[]> {
 
     private RestHighLevelClient getClient() throws MalformedURLException {
         if (client == null) {
-          CredentialsProvider cp = getCredentialsProvider();
-          RestClientBuilder builder = RestClient.builder(new HttpHost(getUrl().getHost(),
-                  getUrl().getPort(), getUrl().getProtocol()));
+            CredentialsProvider cp = getCredentialsProvider();
+            RestClientBuilder builder = RestClient.builder(new HttpHost(getUrl().getHost(),
+                    getUrl().getPort(), getUrl().getProtocol()));
 
-          if (cp != null) {
-              builder.setHttpClientConfigCallback(httpClientBuilder ->
-              httpClientBuilder.setDefaultCredentialsProvider(cp));
-          }
-          client = new RestHighLevelClient(builder);
+            if (cp != null) {
+                builder.setHttpClientConfigCallback(httpClientBuilder ->
+                        httpClientBuilder.setDefaultCredentialsProvider(cp));
+            }
+            client = new RestHighLevelClient(builder);
         }
         return client;
     }
